@@ -317,6 +317,10 @@ def main():
                      help='instrumented build (clang targets): an Android run writes files/dhd-<pid>.profraw at its exit')
     pgo.add_argument('--pgo-use', type=Path, metavar='PROFDATA',
                      help="optimize with this profile (llvm-profdata merge of the .profraw files; switch-arm64: a folder of .gcda files)")
+    # switch-arm64 experiments (finding 270 step 2): each a build switch until a console run decides
+    p.add_argument('--pgo-scope', choices=('game', 'all'), default='game',
+                   help="switch-arm64 --pgo-generate/--pgo-use: the profile over the module's C and vu0_interp.c "
+                        "(game, the default) or over every unit (all)")
     a = p.parse_args()
     t = TARGETS[a.target]
     if not a.fiber_test and not a.fake and not a.module:
@@ -578,8 +582,10 @@ def main():
                 extra += ['-I'+str(ROOT/'port/third_party/libmpeg2')]
             obj = objdir/(rel.replace('/', '_') + suffix)
             flags = common
-            # the Switch's profile covers the game's code and VU only: instrumented, the host's start hangs
-            if t.switch and pgo_flags and not (source.name.startswith('core_') or rel.endswith('vu0_interp.c')):
+            # the Switch's profile covers the game's code and VU only (game), or every unit (all, untested
+            # on a console). The hang an instrumented host gave at start fits libgcov's indirect call
+            # profiler (TLS from tpidr_el0, which is 0 here), now port/nx/pgo/gcov_tls.c (finding 270)
+            if t.switch and pgo_flags and a.pgo_scope == 'game' and not (source.name.startswith('core_') or rel.endswith('vu0_interp.c')):
                 flags = [x for x in common if x not in pgo_flags]
             cmd = flags + extra + (['/c', source, '/Fo'+str(obj)] if t.windows else [source, '-o', obj])
             # the shared object cache (objcache.py); this output folder is a token

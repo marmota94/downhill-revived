@@ -148,6 +148,14 @@ The limit is now the game thread, then `vu`: both are over the 16.7 ms a field h
 code (`core_*.c`) and `vu0_interp.c` carry the profile, for three reasons found on the console:
 
 - With every file instrumented, the game stopped after its first log line and showed a black screen.
+  Read statically since (2026-11-23, not yet run): of libgcov's members only the indirect call
+  profiler reads `tpidr_el0` (the next point). An instrumented host calls instrumented functions
+  through pointers from its start on (`sdl_nx.c`'s `thread_entry` calling `game_thread`, after
+  the first log line), and each such call runs that profiler: the same fault, before `gcov_tls.c`
+  existed. The three points come from one commit, so whether the full scope was tried again with
+  `gcov_tls.c` is not known. Everything else libgcov needs works on libnx (`calloc` in the value
+  profilers, `fopen`/`fwrite` and a pthread mutex at the dump only). `--pgo-scope all` instruments
+  every unit for the console run that settles it; `game` (the default) is the scope above.
 - libgcov's indirect call profiler reads TLS through `tpidr_el0`, which is 0 here, and faulted at
   0x4e8. `port/nx/pgo/gcov_tls.c` replaces it with a `-mtp=soft` build; link it into the training build.
 - libgcov could not create its folders under `sdmc:`, so nothing was saved ("profiling:...:Skip").
