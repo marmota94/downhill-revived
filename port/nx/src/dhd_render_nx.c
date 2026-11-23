@@ -53,6 +53,10 @@ volatile uint64_t nx_pictures, nx_presents, nx_draws, nx_shown, nx_commands;
 /* Nanoseconds on the render thread, none counted twice: recording pictures and probes; every submit;
    waiting for the frame's fence; waiting for a screen image; recording and queueing the present. */
 volatile uint64_t nx_t_record_ns, nx_t_submit_ns, nx_t_gpuwait_ns, nx_t_acquire_ns, nx_t_present_ns;
+/* Barriers that wait (Fragments or Full: the GPU drains its work before what follows), for the heartbeat's
+   barriers a field: what the renderer gains of finding 270 step 3 cut on this GPU, where a pass costs
+   no load or store but each such wait idles the 3D engine. */
+volatile uint64_t nx_barriers;
 static uint64_t now_ns(void) { return armTicksToNs(armGetSystemTick()); }
 
 void nx_screen_size(int *w, int *h);   /* sdl_nx.c: decided once at startup */
@@ -72,6 +76,11 @@ static void nx_logf(const char *format, ...)
 static DkDevice device;
 static DkQueue queue;
 static DkCmdBuf cmd;
+static void barrier(DkBarrier mode, uint32_t invalidate)
+{
+    if (mode != DkBarrier_None) nx_barriers++;
+    dkCmdBufBarrier(cmd, mode, invalidate);
+}
 static DkMemBlock code_block, heap_block, descriptor_block, zread_block, capture_block;
 static DhdrSurface *screen;  /* the live surface, for nx_render_release */
 static DkImageDescriptor *image_descriptors;
@@ -597,7 +606,7 @@ static void uploads_pass(void)
         any = 1;
         dhdr_texture_release(t);
     }
-    if (any) dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    if (any) barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
 }
 
 /* ---- the native renderer's objects ---- */
@@ -706,7 +715,7 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
 static void descriptors_sync(void)
 {
     if (!__atomic_exchange_n(&descriptors_dirty, 0, __ATOMIC_ACQ_REL)) return;
-    dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Descriptors);
+    barrier(DkBarrier_None, DkInvalidateFlags_Descriptors);
 }
 
 static void flush_draw(DhdrNative *n)
@@ -723,13 +732,13 @@ static void surfaces_sync(DhdrNative *n)
 {
     flush_draw(n);
     if (!n->writes && !n->sampled) return;
-    dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
     n->writes = n->sampled = 0;
 }
 /* After a copy-engine write, which the 3D engine doesn't order itself against. */
 static void copied(DhdrNative *n)
 {
-    dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
     n->writes = n->sampled = 0;
 }
 static void pass_end(DhdrNative *n)
@@ -912,7 +921,7 @@ static void surface_copy(DhdrNative *n, const DhdrCommand *k)
     if (k->source == k->target) {
         if (!scratch_ready(n, bx + bw, by + bh)) return;
         copy_box(&s->image, s->size, bx, by, &n->scratch, n->scratch_size, bx, by, bw, bh);
-        dkCmdBufBarrier(cmd, DkBarrier_Fragments, 0);
+        barrier(DkBarrier_Fragments, 0);
         copy_box(&n->scratch, n->scratch_size, bx, by, &s->image, s->size, dx, dy, bw, bh);
     } else {
         copy_box(&s->image, s->size, bx, by, &t->image, t->size, dx, dy, bw, bh);
@@ -1026,7 +1035,7 @@ static void surfaces_prepare(DhdrNative *n)
        with contents it was never told of */
     if (n->zcull_stale) {
         surfaces_sync(n);
-        dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        barrier(DkBarrier_None, DkInvalidateFlags_Zcull);
         n->zcull_stale = 0;
     }
 }
@@ -1340,7 +1349,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
             flush_draw(n);
             dkCmdBufBindRenderTarget(cmd, &n->surfaces[k->target].image.view, depth ? &n->surfaces[k->depth].image.view : NULL);
             if (depth || n->zcull_stale) {
-                dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+                barrier(DkBarrier_None, DkInvalidateFlags_Zcull);
                 n->zcull_stale = 0;
             }
             n->target = k->target, n->depth = depth_index;
@@ -1703,9 +1712,9 @@ static void capture_image(const Image *t, const char *name, uint64_t picture)
     DkCopyBuf to = {dkMemBlockGetGpuAddr(capture_block), t->w * 4, t->h};
     DkImageRect rect;
     copy_rect(&rect, 0, 0, t->w, t->h);
-    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Full, DkInvalidateFlags_Image);
     dkCmdBufCopyImageToBuffer(cmd, &t->view, &rect, &to, 0);
-    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);
+    barrier(DkBarrier_Full, DkInvalidateFlags_L2Cache);
     submit();
     dkQueueWaitIdle(queue);
     char path[128];
@@ -1813,7 +1822,7 @@ int dhdr_native_present(DhdrNative *n, DhdrSurface *s, const DhdrPresentRect *r)
         n->sampled = 1;
     }
     fps_overlay(cmd, s->h);
-    dkCmdBufBarrier(cmd, DkBarrier_Fragments, 0);
+    barrier(DkBarrier_Fragments, 0);
     nx_t_present_ns += now_ns() - record;
     submit();
     return 1;
@@ -1848,7 +1857,7 @@ int dhdr_native_zread_start(DhdrNative *n, uint32_t index, const uint32_t rect[4
     dkCmdBufBindTexture(cmd, DkStage_Compute, 0, dkMakeTextureHandle((uint32_t)s->image.sampled, SAMPLER_NEAREST));
     descriptors_sync();
     dkCmdBufDispatchCompute(cmd, (w + 7) / 8, (h + 7) / 8, 1);
-    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);   /* compute: the one that waits for it */
+    barrier(DkBarrier_Full, DkInvalidateFlags_L2Cache);   /* compute: the one that waits for it */
     nx_t_record_ns += now_ns() - record;
     submit();
     dkQueueSignalFence(queue, &n->zread[slot].fence, true);
