@@ -301,7 +301,7 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
     }
     need = device > padding ? device - padding : 0;
     if (!need) return;
-    if (need > ST_FIFO - ST_HOP) need = ST_FIFO - ST_HOP;
+    if (need > ST_FIFO - 2 * ST_HOP) need = ST_FIFO - 2 * ST_HOP;  /* room for the rate's extra input */
     host_histograms(queued);
     if (out.trace) {
         double now = host_wall_seconds();
@@ -328,7 +328,11 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
         /* proportional rate control: +0.5% when 50% over the cushion (copying only) */
         double error = tempo < 1.0 ? 0 : fill * 0.01;
         host_ratio = 1.0 + (error > RATE_RANGE ? RATE_RANGE : error < -RATE_RANGE ? -RATE_RANGE : error);
-        st_fill(need + 2, tempo);
+        /* `need` output frames at `ratio` read about need * ratio fifo frames, plus the one ahead
+           that the interpolation reads. A fill of need + 2 ran short by a frame or two whenever the
+           rate went above about +1000 ppm: a gap (an underrun, and a click) wherever the device
+           holds no more than one pull beyond this one, as audout does on the Switch (finding 270). */
+        st_fill((unsigned)ceil(need * host_ratio) + 2, tempo);
         made = host_resample(buf, need, host_ratio, &out.phase);
         if (made < need && padding - request + made < request) {
             out.running = 0; /* out of cushion: this pull runs short; one gap, then build it again */
