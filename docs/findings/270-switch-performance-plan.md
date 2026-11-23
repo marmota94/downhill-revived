@@ -302,6 +302,42 @@ merge in a throwaway worktree. Nothing from it is used here.
   main's NRO above): published as a prerelease, then made a full release the same day at the
   owner's choice, with the known gaps (no steady 60) in its notes. The steps and the open work are
   in `docs/BUILDING.md`, "Switch releases".
+- [x] 2026-11-23: the target clocks are now stock, 1020/460/1331 MHz with sys-clk off (the owner's
+  choice); runs with sys-clk on swung between 47 and 60 fields/s and do not count. Four lanes in
+  parallel, each on its own branch from `main`, then one console session at those clocks
+  (`bench_race.py`'s route, 6000-7000):
+
+  | Build | Race fields/s | p99 ms | Picture |
+  |---|---|---|---|
+  | `main` (pinned 0.7.6 draw stages) | 27.9 | 43.2 | right |
+  | `switch/render-gains`, both switches off | 29.2 | 43.1 | right |
+  | `switch/render-gains`, conversions batched | 39.5 | 30.2 | right |
+  | `switch/render-gains`, batched and direct present | 39.8 | 29.1 | right |
+  | `switch/uam-fault`, main's stages flattened | 27.4 | 43.9 | blocks |
+  | `switch/uam-fault`, flattened, safe schedule | 33.8 | 36.1 | right |
+  | `switch/uam-fault`, main's stages, safe schedule | 37.0 | 31.6 | right |
+  | `switch/combined` (the three lanes, main's stages, safe schedule) | 40.4 | 29.2 | right |
+
+  - `switch/render-gains`: finding 112's prepared conversions now share one barrier
+    (`DHD_NX_CONVERT_BATCH=0` turns it off), +35 %; finding 247's present from the display surface
+    (`DHD_DIRECT_PRESENT=0`), +0.8 %, kept since it costs nothing; a barrier count in the heartbeat.
+    Finding 111's probe change is gone from main (`58ee539e`) and finding 109 caches Vulkan objects
+    that deko3d has none of: nothing to port.
+  - `switch/uam-fault`: the second uam fault is its schedule. A Maxwell interpreter run on uam's code
+    for main's `native_pixel` matched a model of the WGSL over 1200 pixels, so `f2f round` and the
+    texel load compute right; the console then showed that flattening the per-pixel branches alone
+    leaves blocks, and a schedule where every draw-stage instruction waits on all barriers (stall
+    15, no operand reuse) draws right, and faster. `switch/combined` makes that the build
+    (`draw_schedule`) and deletes the pinned copy (Decisions).
+  - `switch/audio`: the underruns were the resampler's fill, `need + 2` frames for `need * ratio`;
+    above about +1000 ppm each pull came 1-4 frames short, and audout's three buffers left no slack
+    to hide it. Now `ceil(need * ratio) + 2` (shared host code, `port/host/sound_out_sdl.c`): 0
+    underruns and 0 ms of silence in the combined race (1178 before). The bench line gains
+    `mix_ms_per_tick` (about 1.5-2.2 ms) and the exit a `snd session:` line. Moving the mixer off
+    the game thread is not done: its results feed game state inside the core.
+  - `switch/cpu-flags` (`-mcpu=cortex-a57`, LTO, the PGO hang) was stopped before a build finished.
+  - A first combined run left the race at field 3337 through EXIT GAME's path with no bench line;
+    the rerun, with nobody touching the console, passed. Not explained beyond that.
 
 ## Decisions
 
@@ -309,16 +345,14 @@ merge in a throwaway worktree. Nothing from it is used here.
   stays and the branch can be compared with the first commit.
 - Clocks, the deko3d library and the route are fixed before any number counts, because finding 127
   changed descriptors and clocks together and could not split their effects.
-- The Switch's draw stages (`native_vertex`, `native_pixel`, `native_pixel_dual`) are built from a
-  pinned copy of 0.7.6's draw shaders, `port/nx/native_draws.wgsl`; `nx_shaders.py` builds every other
-  stage, the conversion included, from main's `port/gs/native.wgsl`. This is a deliberate exception to
-  the one-code-path rule (finding 099): uam miscompiles main's newer draw shaders (above), and finding
-  the exact pattern would take a console run per guess. The copy is the text `dhd_render_nx.c` was
-  written for. Cost: the Switch draws without main's shader features since 0.7.6, among them smooth
-  bilinear when upscaled (196), R32Uint texels and native VU meshes; none is in use on the Switch today
-  (scale 1, `native_vu` off). The copy goes when uam compiles main's draw shaders correctly or the
-  pattern is found and patched in `nx_shaders.py`; until then a draw shader change on main is not
-  seen by the Switch.
+- (2026-11-23, replaces the pinned copy of 0.7.6's draw shaders, `port/nx/native_draws.wgsl`, kept
+  from 2026-11-18 as an exception to finding 099.) Every Switch stage is built from main's
+  `port/gs/native.wgsl`; the draw stages (`native_vertex`, `native_pixel`, `native_pixel_dual`) get a
+  hazard-free schedule (`nx_shaders.py`'s `draw_schedule`) in place of uam's, which drew warp-sized
+  blocks of wrong texels. Which hazard in uam's schedule is at fault is not known; a narrower patch
+  that keeps more of uam's schedule could be faster.
+- The performance target is stock clocks, 1020/460/1331 MHz with sys-clk off (the owner,
+  2026-11-23). Numbers at 1785/768/1600 from before that date compare only with each other.
 
 ## Surprises
 

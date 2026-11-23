@@ -291,6 +291,7 @@ int nx_gpu_error(void);
 #define NX_TIMERS(X) X(record) X(submit) X(gpuwait) X(acquire) X(present)
 #define NX_TIMER_DECLARE(name) extern volatile uint64_t nx_t_##name##_ns __attribute__((weak));
 NX_TIMERS(NX_TIMER_DECLARE)
+extern volatile uint64_t nx_barriers __attribute__((weak));   /* barriers that wait (dhd_render_nx.c) */
 
 /* The clocks really running, for the heartbeat: a sys-clk profile only applies under its conditions.
    0 when the service is closed to this process. */
@@ -317,6 +318,7 @@ static void heartbeat_line(double now)
     static uint64_t last_field;
 #define NX_TIMER_LAST(name) static uint64_t last_##name;
     NX_TIMERS(NX_TIMER_LAST)
+    static uint64_t last_barriers;
     uint64_t field = *(volatile uint64_t *)&kernel_vsync_count;
     uint64_t fields = field - last_field;
     double elapsed = now - last, per_field = fields ? 1e6 * (double)fields : 1e30;  /* no field: 0.00 */
@@ -338,6 +340,12 @@ static void heartbeat_line(double now)
         last_##name = total; \
     }
     NX_TIMERS(NX_TIMER_PRINT)
+    {
+        uint64_t barriers = &nx_barriers ? nx_barriers : 0;
+        if (n > 0 && (size_t)n < sizeof line)
+            n += snprintf(line + n, sizeof line - (size_t)n, "; barriers %.1f a field", fields ? (double)(barriers - last_barriers) / (double)fields : 0.0);
+        last_barriers = barriers;
+    }
     if (n > 0 && (size_t)n < sizeof line)
         n += snprintf(line + n, sizeof line - (size_t)n, "; MHz cpu %u gpu %u mem %u", clock_mhz(PcvModuleId_CpuBus),
                       clock_mhz(PcvModuleId_GPU), clock_mhz(PcvModuleId_EMC));
