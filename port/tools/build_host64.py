@@ -548,7 +548,6 @@ def main():
             # deko3d's shaders, compiled now (nx_shaders.py: naga and uam)
             import nx_shaders
             run([sys.executable, ROOT/'port/tools/nx_shaders.py', work/'nx_shaders.inc'])
-            run([sys.executable, ROOT/'port/tools/nx_shaders_present.py', work/'nx_present.inc'])
         else:
             # one section per function and datum, as the Windows build's /Gy: the link
             # garbage-collects what nothing references (/opt:ref there)

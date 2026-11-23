@@ -15,6 +15,8 @@ What stock uam (1.1.0) gets wrong is worked around here, each with a check that 
 - a dynamic index into a vector's components reads .x (nx_pick).
 - its dual-issue scheduling corrupts warp-sized blocks of pixels (no_dual_issue).
 - it gives a graphics stage no off-chip call/return stack, whatever its branches' nesting (with_crs).
+- its schedule leaves a hazard in the draw stages that draws warp-sized blocks of wrong texels
+  (draw_schedule; finding 270).
 native_convert runs as a pixel shader into a render target, the path everything else already proves:
 the one compute shader that wrote an image (native_scanout, now a blit) came out in broken blocks."""
 import os, re, struct, subprocess, sys, tempfile
@@ -25,7 +27,7 @@ KIT = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 NAGA = os.environ.get('NAGA') or str(Path.home() / 'DevCaches/naga/naga')
 ENTRIES = (('native_vertex', 'vert'), ('native_mesh_vertex', 'vert'), ('native_pixel', 'frag'), ('native_pixel_dual', 'frag'),
            ('fullscreen_vertex', 'vert'), ('native_blit', 'frag'), ('native_upload_alpha', 'frag'),
-           ('native_grow_depth', 'frag'), ('native_convert', 'frag'), ('present_pixel', 'frag'))
+           ('native_grow_depth', 'frag'), ('native_convert', 'frag'), ('present_pixel', 'frag'), ('present_direct', 'frag'))
 DRAW_ENTRIES = ('native_vertex', 'native_pixel', 'native_pixel_dual')
 DIVISION_WARNING = 'non-constant integer division'
 
@@ -52,112 +54,6 @@ fn nx_inverse(i: u32) -> u32 {
 }
 '''
     return patched(text, CONVERT_PATCHES + TEXEL_PATCHES)
-
-
-def draws_wgsl():
-    """The draw stages' WGSL: port/nx/native_draws.wgsl, 0.7.6's native.wgsl and native_dual.wgsl
-    (finding 270: uam turns main's newer draw stages into blocks of wrong texels)."""
-    text = 'enable dual_source_blending;\n' + (ROOT / 'port/nx/native_draws.wgsl').read_text()
-    text = text.replace('texture_depth_2d', 'texture_2d<f32>')
-    text, n = re.subn(r'(fn load_depth\(t: texture_2d<f32>, xy: vec2<i32>\) -> f32 \{.*?return textureLoad\(t, xy, 0\))(;)',
-                      r'\1.r\2', text, flags=re.S)
-    if n != 1:
-        sys.exit('nx_shaders: load_depth not found')
-    # its conversion is 0.7.6's (CONVERT_PATCHES fit main's); naga checks every entry point, and the
-    # Switch builds the conversion from main's (wgsl())
-    at = text.find('fn native_convert(')
-    if at < 0:
-        sys.exit('nx_shaders: native_convert not found in native_draws.wgsl')
-    start, depth, i = text.rfind('\n@', 0, at) + 1, 0, text.index('{', at)
-    while True:
-        depth += {'{': 1, '}': -1}.get(text[i], 0)
-        i += 1
-        if not depth:
-            break
-    return patched(text[:start] + text[i:], TEXEL_PATCHES)
-
-
-def flat_draws_wgsl():
-    """main's draw stages (wgsl()) with their per-pixel decisions as selects instead of branches: the
-    same values, but `&&` and `||` (naga writes them as GLSL's short-circuit operators, which become
-    branches when an operand calls a function), wrap_coordinate's early returns and combine's ifs
-    become selects, and a bounds test one all() of a vec4<bool>. What is left to
-    branch on is uniform (the draw's flags: replacement, bilinear, textured). The candidate for
-    NX_DRAWS=flat (finding 270): main's stages nest 11 deep, 0.7.6's 7, and only stages nesting 8
-    or less have drawn right on the console."""
-    return patched_text(wgsl(), FLAT_PATCHES)
-
-
-FLAT_PATCHES = (
-    # load_texel: the size by select, the bounds test without short-circuit
-    ('    if (texture_sized()) { size = vec2<i32>(nat.tex_size); } else { size = vec2<i32>(textureDimensions(native_texture)); }\n'
-     '    let v = textureLoad(native_texture, clamp(xy, vec2<i32>(0), size - 1), 0);\n'
-     '    return select(vec4<f32>(0.0), v, all(xy >= vec2<i32>(0)) && all(xy < size));',
-     '    size = select(vec2<i32>(textureDimensions(native_texture)), vec2<i32>(nat.tex_size), texture_sized());\n'
-     '    let v = textureLoad(native_texture, clamp(xy, vec2<i32>(0), size - 1), 0);\n'
-     '    return select(vec4<f32>(0.0), v, all(vec4<bool>(xy >= vec2<i32>(0), xy < size)));'),
-    # wrap_coordinate: all four modes, one chosen
-    ('''    if (mode == 0u) { return u32(c) & (size - 1u); }
-    if (mode == 1u) { return u32(clamp(c, 0, i32(size) - 1)); }
-    if (mode == 2u) { return u32(clamp(c, i32(low), i32(high))); }
-    return (u32(c) & low) | high;''',
-     '''    let repeat = u32(c) & (size - 1u);
-    let clamped = u32(clamp(c, 0, i32(size) - 1));
-    let region = u32(clamp(c, i32(low), i32(high)));
-    let region_repeat = (u32(c) & low) | high;
-    return select(select(select(region_repeat, region, mode == 2u), clamped, mode == 1u), repeat, mode == 0u);'''),
-    # fetch: the upscaled sprite's corner always computed, applied by select
-    ('''        if ((flags & 1024u) != 0u && (flags & 32u) == 0u && T > 1u && E == 1u) {
-            let corner = floor(i.position.xy / f32(T)) * f32(T) - i.position.xy;
-            uv += across * corner.x + down * corner.y;
-        }''',
-     '''        let corner = floor(i.position.xy / f32(T)) * f32(T) - i.position.xy;
-        uv = select(uv, uv + (across * corner.x + down * corner.y),
-                    ((flags & 1024u) != 0u) & ((flags & 32u) == 0u) & (T > 1u) & (E == 1u));'''),
-    # combine: the alpha, the alpha test and the colour by selects; only the discard stays an if
-    ('''    var a = i.color.a;
-    if (textured && (flags & 2u) != 0u) {
-        if (tfx == 0u) { a = min(floor(t.a * i.color.a / 128.0), 255.0); }
-        else if (tfx == 2u) { a = min(t.a + i.color.a, 255.0); }
-        else { a = t.a; }
-    }
-    if ((flags & 64u) != 0u) {
-        let ua = u32(a);
-        let r = nat.aref;
-        let test = alpha_test();
-        let passed = test == 1u || (test == 2u && ua < r) || (test == 3u && ua <= r) || (test == 4u && ua == r) ||
-                     (test == 5u && ua >= r) || (test == 6u && ua > r) || (test == 7u && ua != r);
-        if (passed == ((flags & 128u) != 0u)) { discard; }
-    }
-    var rgb = i.color.rgb;
-    if (textured) {
-        rgb = select(min(floor(t.rgb * i.color.rgb / 128.0), vec3<f32>(255.0)), t.rgb, tfx == 1u);
-        if (tfx >= 2u) { rgb = min(rgb + i.color.a, vec3<f32>(255.0)); }
-    }
-    if ((flags & 16u) != 0u) { rgb = floor(mix(nat.fog.rgb, rgb, i.stqf.w)); }
-    if ((flags & 512u) != 0u) { rgb = floor(rgb * a / 128.0); }''',
-     '''    let ta = select(select(t.a, min(t.a + i.color.a, 255.0), tfx == 2u), min(floor(t.a * i.color.a / 128.0), 255.0), tfx == 0u);
-    let a = select(i.color.a, ta, textured & ((flags & 2u) != 0u));
-    let ua = u32(a);
-    let r = nat.aref;
-    let test = alpha_test();
-    let passed = select(false, select(select(select(select(select(select(ua != r, ua > r, test == 6u), ua >= r, test == 5u),
-                                                                 ua == r, test == 4u), ua <= r, test == 3u), ua < r, test == 2u),
-                                      true, test == 1u), test != 0u);
-    if (((flags & 64u) != 0u) & (passed == ((flags & 128u) != 0u))) { discard; }
-    let modulated = select(min(floor(t.rgb * i.color.rgb / 128.0), vec3<f32>(255.0)), t.rgb, tfx == 1u);
-    let highlighted = select(modulated, min(modulated + i.color.a, vec3<f32>(255.0)), tfx >= 2u);
-    var rgb = select(i.color.rgb, highlighted, textured);
-    rgb = select(rgb, floor(mix(nat.fog.rgb, rgb, i.stqf.w)), (flags & 16u) != 0u);
-    rgb = select(rgb, floor(rgb * a / 128.0), (flags & 512u) != 0u);'''),
-    # the texel step's division (patched() appends it): b is never 0 here (E is 1 or more), by select anyway
-    ('''fn nx_div(a: u32, b: u32) -> u32 {
-    if (b == 0u) { return a; }
-    return u32(floor((f32(a) + 0.5) / f32(b)));
-}''',
-     '''fn nx_div(a: u32, b: u32) -> u32 {
-    return select(u32(floor((f32(a) + 0.5) / f32(b))), a, b == 0u);
-}'''))
 
 
 def patched_text(text, patches):
@@ -279,11 +175,12 @@ def no_dual_issue(dksh, raw, entry):
     return bytes(out), pairs
 
 
-def safe_schedule(dksh, raw, at):
-    """NX_SCHED=safe (a test build, finding 270): every instruction of a draw stage waits for all six
-    dependency barriers, stalls the longest (15 cycles) and sets no operand reuse, so no schedule
-    hazard can remain: what still draws wrong then is not uam's schedule. Slow. at: where the code
-    starts in dksh."""
+def draw_schedule(dksh, raw, at):
+    """The draw stages' schedule without hazards: every instruction waits for all six dependency
+    barriers, stalls the longest (15 cycles) and sets no operand reuse. uam's own schedule for main's
+    draw stages drew warp-sized blocks of wrong texels on the console although the code computes the
+    right values in order (finding 270); with this one they draw right, and faster than 0.7.6's
+    stages did with uam's schedule. at: where the code starts in dksh."""
     out = bytearray(dksh)
     for group in range(at, at + len(raw), 32):
         word = int.from_bytes(out[group:group + 8], 'little')
@@ -370,7 +267,7 @@ def with_crs(dksh, raw, entry):
     return bytes(out), depth
 
 
-def build(work, source, entry, stage, safe=False):
+def build(work, source, entry, stage):
     glsl = work / ('%s.%s' % (entry, stage))
     r = subprocess.run([NAGA, str(source), str(glsl), '--entry-point', entry, '--profile', 'core460', '--keep-coordinate-space'],
                        capture_output=True, text=True, env=dict(os.environ, NO_COLOR='1'))
@@ -393,8 +290,8 @@ def build(work, source, entry, stage, safe=False):
     pairs = 0
     if not os.environ.get('NX_DUAL_ISSUE'):
         data, pairs = no_dual_issue(data, code, entry)
-    if safe:
-        data = safe_schedule(data, code, code_at)
+    if entry in DRAW_ENTRIES:
+        data = draw_schedule(data, code, code_at)
     return data, pairs, depth
 
 
@@ -404,20 +301,9 @@ def main():
         work = Path(t)
         (work / 'native.wgsl').write_text(wgsl())
         (work / 'zread.wgsl').write_text(probe())
-        lines = ['/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl, port/nx/native_draws.wgsl and zread.rs\'s probe. */']
-        # test builds for a console run (finding 270): NX_DRAWS=main, the draw stages from main's native.wgsl;
-        # NX_DRAWS=flat, from main's without per-pixel branches (flat_draws_wgsl); NX_SCHED=safe, the draw
-        # stages' schedule without hazards (safe_schedule)
-        mode = os.environ.get('NX_DRAWS') or 'pinned'
-        draws = {'pinned': draws_wgsl, 'main': wgsl, 'flat': flat_draws_wgsl}.get(mode)
-        if not draws:
-            sys.exit('nx_shaders: NX_DRAWS is pinned, main or flat, not %s' % mode)
-        (work / 'draws.wgsl').write_text(draws())
-        safe = os.environ.get('NX_SCHED') == 'safe'
-        print('nx_shaders: draw stages from %s%s' % (mode, ', safe schedule' if safe else ''))
-        for name, source, stage in [(e, work / ('draws.wgsl' if e in DRAW_ENTRIES else 'native.wgsl'), s) for e, s in ENTRIES] + \
-                                   [('zread', work / 'zread.wgsl', 'comp')]:
-            data, pairs, depth = build(work, source, name, stage, safe and name in DRAW_ENTRIES)
+        lines = ["/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl and zread.rs's probe. */"]
+        for name, source, stage in [(e, work / 'native.wgsl', s) for e, s in ENTRIES] + [('zread', work / 'zread.wgsl', 'comp')]:
+            data, pairs, depth = build(work, source, name, stage)
             lines.append('static const unsigned char dksh_%s[] __attribute__((aligned(256))) = {%s};' % (name, ','.join(map(str, data))))
             print('%s.%s: %d bytes, %d dual-issue pairs undone, branches nested %d deep' % (name, stage, len(data), pairs, depth))
         out.write_text('\n'.join(lines) + '\n')

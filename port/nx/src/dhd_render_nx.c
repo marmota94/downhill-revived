@@ -29,7 +29,6 @@
 #include <string.h>
 #include <switch.h>
 #include "nx_shaders.inc"
-#include "nx_present.inc"
 
 enum {
     FRAMES = 3,
