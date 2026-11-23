@@ -538,14 +538,13 @@ Steps, in order:
 button rebinding. Done: the 30 option (`fps = 30`), the exit, rebinding. Open (finding 270), each
 one worth a new `-switch.N` release when it lands:
 
-- **A steady 60.** Docked at 1785/768/1600 MHz a race runs at about 46-54 fields a second and the
-  menus at about 45. The work, in order:
-  - Native VU's mesh path: main's draw stages (`NX_DRAWS=main`) are still broken on the console
-    (the second uam fault, `f2f round` and the branch around the texel load). Then `native_vu` on
-    by default on the Switch, then the renderer gains one at a time (findings 112, 109, 247, 111).
-  - Profile-guided build, threads and cores (the game thread takes about 17-21 ms a field), LTO and
-    `-mcpu=cortex-a57`. Keep a change only for about 3 % or more over the race.
-  - The sound underruns (600-1500 a run).
+- **A steady 60.** The target is stock clocks, 1020/460/1331 MHz with sys-clk off: there a race
+  runs at about 40 fields a second (finding 270, 2026-11-23: main's draw stages with a hazard-free
+  schedule, batched conversions, the present from the display surface). The work, in order:
+  - `native_vu` on by default on the Switch, measured at those clocks.
+  - Profile-guided build, threads and cores, LTO and `-mcpu=cortex-a57`. Keep a change only for
+    about 3 % or more over the race.
+  - A narrower fix for uam's schedule than waiting on every barrier, if it is faster.
 - **Docked default scale 2**, only once a run holds 60.
 - **The error after closing the Homebrew Menu.** Find out whether sphaira alone, closed with +,
   also shows "The software was closed because an error occurred" (reported by others; if so, it is
