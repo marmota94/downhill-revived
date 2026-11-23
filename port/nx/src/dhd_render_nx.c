@@ -1041,7 +1041,25 @@ static void surfaces_prepare(DhdrNative *n)
 }
 
 /* ---- conversions (convert.rs) ---- */
-static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i)
+/* DHD_NX_CONVERT_BATCH (on unless 0; finding 270 step 3, after finding 112): the conversions render()
+   prepares together at a pass boundary go without a barrier between them. Each reads surfaces and
+   writes its own image; after the first one's barrier nothing but those conversions is recorded, so
+   none reads what another wrote, nor writes what a draw may still be reading. The draws that sample
+   them wait once, after the last (render's reads_surface). Off: a barrier before each, as before. */
+static int convert_batch(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DHD_NX_CONVERT_BATCH");
+        on = !(v && !strcmp(v, "0"));
+        nx_logf("nx renderer: prepared conversions %s (DHD_NX_CONVERT_BATCH)", on ? "batched, one barrier" : "a barrier each");
+    }
+    return on;
+}
+
+/* Conversion i into its image. batched: it follows another of render's prepared run, with nothing
+   recorded between (convert_batch): no barrier. */
+static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i, int batched)
 {
     if (i < 0 || (uint32_t)i >= p->convert_count || i >= CONVERTS) return NULL;
     const DhdrConvert *v = &p->converts[i];
@@ -1070,7 +1088,7 @@ static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i)
         if (!n->has_converted[i]) return NULL;
     }
     pass_end(n);
-    surfaces_sync(n);
+    if (!batched) surfaces_sync(n);
     DkGpuAddr uniform = constants_of(&constants, sizeof constants);
     if (uniform == DK_GPU_ADDR_INVALID) return NULL;
     const Image *base = v->base ? &v->base->image : &dummy;
@@ -1268,6 +1286,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
            otherwise end the pass it is needed in. Their inputs can't change in the run. */
         if (n->target != k->target || n->depth != (depth ? k->depth : -1)) {
             uint64_t prepared = 0;
+            int batched = 0;   /* a conversion of this run recorded: the next needs no barrier */
             for (uint32_t j = i; j < p->command_count; j++) {
                 const DhdrCommand *next = &p->commands[j];
                 if (next->kind != DHDR_CMD_DRAW || next->target != k->target || next->depth != k->depth ||
@@ -1285,8 +1304,8 @@ static void render(DhdrNative *n, const DhdrPicture *p)
                     if (v->surface[s] < SURFACES) stamp[s] = versions[v->surface[s]];
                 }
                 if (in_pass || (conversions[ci] && !memcmp(stamps[ci], stamp, sizeof stamp))) continue;
-                const Image *made = convert_run(n, p, ci);
-                if (made) { conversions[ci] = made; memcpy(stamps[ci], stamp, sizeof stamp); }
+                const Image *made = convert_run(n, p, ci, batched);
+                if (made) { conversions[ci] = made; memcpy(stamps[ci], stamp, sizeof stamp); batched = convert_batch(); }
             }
         }
 
@@ -1322,7 +1341,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
                 if (ci < CONVERTS && conversions[ci] && v && !memcmp(stamps[ci], stamp, sizeof stamp)) {
                     converted = conversions[ci];
                 } else {
-                    converted = convert_run(n, p, ci);
+                    converted = convert_run(n, p, ci, 0);
                     if (ci < CONVERTS && converted) { conversions[ci] = converted; memcpy(stamps[ci], stamp, sizeof stamp); }
                 }
                 last_convert = ci;
