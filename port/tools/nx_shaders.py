@@ -15,6 +15,8 @@ What stock uam (1.1.0) gets wrong is worked around here, each with a check that 
 - a dynamic index into a vector's components reads .x (nx_pick).
 - its dual-issue scheduling corrupts warp-sized blocks of pixels (no_dual_issue).
 - it gives a graphics stage no off-chip call/return stack, whatever its branches' nesting (with_crs).
+- its schedule leaves a hazard in the draw stages that draws warp-sized blocks of wrong texels
+  (draw_schedule; finding 270).
 native_convert runs as a pixel shader into a render target, the path everything else already proves:
 the one compute shader that wrote an image (native_scanout, now a blit) came out in broken blocks."""
 import os, re, struct, subprocess, sys, tempfile
@@ -25,7 +27,7 @@ KIT = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 NAGA = os.environ.get('NAGA') or str(Path.home() / 'DevCaches/naga/naga')
 ENTRIES = (('native_vertex', 'vert'), ('native_mesh_vertex', 'vert'), ('native_pixel', 'frag'), ('native_pixel_dual', 'frag'),
            ('fullscreen_vertex', 'vert'), ('native_blit', 'frag'), ('native_upload_alpha', 'frag'),
-           ('native_grow_depth', 'frag'), ('native_convert', 'frag'), ('present_pixel', 'frag'))
+           ('native_grow_depth', 'frag'), ('native_convert', 'frag'), ('present_pixel', 'frag'), ('present_direct', 'frag'))
 DRAW_ENTRIES = ('native_vertex', 'native_pixel', 'native_pixel_dual')
 DIVISION_WARNING = 'non-constant integer division'
 
@@ -54,27 +56,13 @@ fn nx_inverse(i: u32) -> u32 {
     return patched(text, CONVERT_PATCHES + TEXEL_PATCHES)
 
 
-def draws_wgsl():
-    """The draw stages' WGSL: port/nx/native_draws.wgsl, 0.7.6's native.wgsl and native_dual.wgsl
-    (finding 270: uam turns main's newer draw stages into blocks of wrong texels)."""
-    text = 'enable dual_source_blending;\n' + (ROOT / 'port/nx/native_draws.wgsl').read_text()
-    text = text.replace('texture_depth_2d', 'texture_2d<f32>')
-    text, n = re.subn(r'(fn load_depth\(t: texture_2d<f32>, xy: vec2<i32>\) -> f32 \{.*?return textureLoad\(t, xy, 0\))(;)',
-                      r'\1.r\2', text, flags=re.S)
-    if n != 1:
-        sys.exit('nx_shaders: load_depth not found')
-    # its conversion is 0.7.6's (CONVERT_PATCHES fit main's); naga checks every entry point, and the
-    # Switch builds the conversion from main's (wgsl())
-    at = text.find('fn native_convert(')
-    if at < 0:
-        sys.exit('nx_shaders: native_convert not found in native_draws.wgsl')
-    start, depth, i = text.rfind('\n@', 0, at) + 1, 0, text.index('{', at)
-    while True:
-        depth += {'{': 1, '}': -1}.get(text[i], 0)
-        i += 1
-        if not depth:
-            break
-    return patched(text[:start] + text[i:], TEXEL_PATCHES)
+def patched_text(text, patches):
+    """text with each patch applied (all must apply)."""
+    for old, new in patches:
+        if old not in text:
+            sys.exit('nx_shaders: %s not found' % old.strip().split('\n')[0])
+        text = text.replace(old, new)
+    return text
 
 
 def patched(text, patches):
@@ -187,6 +175,23 @@ def no_dual_issue(dksh, raw, entry):
     return bytes(out), pairs
 
 
+def draw_schedule(dksh, raw, at):
+    """The draw stages' schedule without hazards: every instruction waits for all six dependency
+    barriers, stalls the longest (15 cycles) and sets no operand reuse. uam's own schedule for main's
+    draw stages drew warp-sized blocks of wrong texels on the console although the code computes the
+    right values in order (finding 270); with this one they draw right, and faster than 0.7.6's
+    stages did with uam's schedule. at: where the code starts in dksh."""
+    out = bytearray(dksh)
+    for group in range(at, at + len(raw), 32):
+        word = int.from_bytes(out[group:group + 8], 'little')
+        for k in range(3):
+            c = word >> (21 * k) & 0x1FFFFF
+            c = (c & 0x7E0) | 0x1F800 | 15          # its own barriers kept; waits on all, stall 15, no yield or reuse
+            word = word & ~(0x1FFFFF << (21 * k)) | c << (21 * k)
+        out[group:group + 8] = word.to_bytes(8, 'little')
+    return bytes(out)
+
+
 def branch_depth(raw):
     """The deepest nesting of SSY, PBK and PCNT (each pushes a reconvergence entry on the warp's
     call/return stack, popped by SYNC, BRK or CONT) over every path through the Maxwell code raw:
@@ -280,10 +285,13 @@ def build(work, source, entry, stage):
     if DIVISION_WARNING in messages:
         sys.exit('nx_shaders: %s divides by a non-constant, which uam turns into an inexact float: rewrite it in wgsl()' % entry)
     data, code = dksh.read_bytes(), raw.read_bytes()
+    code_at = data.find(code)
     data, depth = with_crs(data, code, entry)
     pairs = 0
     if not os.environ.get('NX_DUAL_ISSUE'):
         data, pairs = no_dual_issue(data, code, entry)
+    if entry in DRAW_ENTRIES:
+        data = draw_schedule(data, code, code_at)
     return data, pairs, depth
 
 
@@ -292,13 +300,9 @@ def main():
     with tempfile.TemporaryDirectory() as t:
         work = Path(t)
         (work / 'native.wgsl').write_text(wgsl())
-        (work / 'draws.wgsl').write_text(draws_wgsl())
         (work / 'zread.wgsl').write_text(probe())
-        lines = ['/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl, port/nx/native_draws.wgsl and zread.rs\'s probe. */']
-        # NX_DRAWS=main: the draw stages from main's native.wgsl, for a console run (finding 270)
-        draws = 'native.wgsl' if os.environ.get('NX_DRAWS') == 'main' else 'draws.wgsl'
-        for name, source, stage in [(e, work / (draws if e in DRAW_ENTRIES else 'native.wgsl'), s) for e, s in ENTRIES] + \
-                                   [('zread', work / 'zread.wgsl', 'comp')]:
+        lines = ["/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl and zread.rs's probe. */"]
+        for name, source, stage in [(e, work / 'native.wgsl', s) for e, s in ENTRIES] + [('zread', work / 'zread.wgsl', 'comp')]:
             data, pairs, depth = build(work, source, name, stage)
             lines.append('static const unsigned char dksh_%s[] __attribute__((aligned(256))) = {%s};' % (name, ','.join(map(str, data))))
             print('%s.%s: %d bytes, %d dual-issue pairs undone, branches nested %d deep' % (name, stage, len(data), pairs, depth))

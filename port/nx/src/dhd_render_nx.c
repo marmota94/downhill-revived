@@ -53,6 +53,10 @@ volatile uint64_t nx_pictures, nx_presents, nx_draws, nx_shown, nx_commands;
 /* Nanoseconds on the render thread, none counted twice: recording pictures and probes; every submit;
    waiting for the frame's fence; waiting for a screen image; recording and queueing the present. */
 volatile uint64_t nx_t_record_ns, nx_t_submit_ns, nx_t_gpuwait_ns, nx_t_acquire_ns, nx_t_present_ns;
+/* Barriers that wait (Fragments or Full: the GPU drains its work before what follows), for the heartbeat's
+   barriers a field: what the renderer gains of finding 270 step 3 cut on this GPU, where a pass costs
+   no load or store but each such wait idles the 3D engine. */
+volatile uint64_t nx_barriers;
 static uint64_t now_ns(void) { return armTicksToNs(armGetSystemTick()); }
 
 void nx_screen_size(int *w, int *h);   /* sdl_nx.c: decided once at startup */
@@ -72,6 +76,11 @@ static void nx_logf(const char *format, ...)
 static DkDevice device;
 static DkQueue queue;
 static DkCmdBuf cmd;
+static void barrier(DkBarrier mode, uint32_t invalidate)
+{
+    if (mode != DkBarrier_None) nx_barriers++;
+    dkCmdBufBarrier(cmd, mode, invalidate);
+}
 static DkMemBlock code_block, heap_block, descriptor_block, zread_block, capture_block;
 static DhdrSurface *screen;  /* the live surface, for nx_render_release */
 static DkImageDescriptor *image_descriptors;
@@ -106,7 +115,7 @@ static unsigned frame_index;
 static uint64_t frame_count;
 
 static DkShader shader_vertex, shader_mesh, shader_pixel, shader_dual, shader_fullscreen, shader_blit,
-                shader_upload, shader_grow, shader_convert, shader_present, shader_zread;
+                shader_upload, shader_grow, shader_convert, shader_present, shader_present_direct, shader_zread;
 
 static void debug_callback(void *user, const char *context, DkResult result, const char *message)
 {
@@ -466,7 +475,7 @@ int dhdr_device_init(const DhdrDeviceDesc *d)
              LOAD(shader_pixel, native_pixel) && LOAD(shader_dual, native_pixel_dual) &&
              LOAD(shader_fullscreen, fullscreen_vertex) && LOAD(shader_blit, native_blit) &&
              LOAD(shader_upload, native_upload_alpha) && LOAD(shader_grow, native_grow_depth) && LOAD(shader_convert, native_convert) &&
-             LOAD(shader_present, present_pixel) && LOAD(shader_zread, zread);
+             LOAD(shader_present, present_pixel) && LOAD(shader_present_direct, present_direct) && LOAD(shader_zread, zread);
     if (!ok) {
         nx_log("gs native: a shader did not load");
         ready = -1;
@@ -597,7 +606,7 @@ static void uploads_pass(void)
         any = 1;
         dhdr_texture_release(t);
     }
-    if (any) dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    if (any) barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
 }
 
 /* ---- the native renderer's objects ---- */
@@ -614,6 +623,11 @@ struct DhdrNative {
     Image converted[CONVERTS];
     int has_converted[CONVERTS];
     uint32_t present_sampler;
+    /* The last picture, shown straight from its display surface (finding 247; -1: the display image
+       holds it): that surface, the picture's rectangle there (x, y, width, rows read) and its rows on
+       screen (twice the rows read when doubled). The display image doesn't hold it until materialize. */
+    int direct_surface;
+    uint32_t direct_rect[4], direct_h;
     /* the open draw pass; -2: none */
     int target, depth;
     int indexed;
@@ -649,6 +663,7 @@ DhdrNative *dhdr_native_create(uint32_t flags)
     DhdrNative *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     n->target = n->depth = -2;
+    n->direct_surface = -1;
     n->present_sampler = SAMPLER_LINEAR;   /* Native::create's first options(0) */
     return n;
 }
@@ -706,7 +721,7 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
 static void descriptors_sync(void)
 {
     if (!__atomic_exchange_n(&descriptors_dirty, 0, __ATOMIC_ACQ_REL)) return;
-    dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Descriptors);
+    barrier(DkBarrier_None, DkInvalidateFlags_Descriptors);
 }
 
 static void flush_draw(DhdrNative *n)
@@ -723,13 +738,13 @@ static void surfaces_sync(DhdrNative *n)
 {
     flush_draw(n);
     if (!n->writes && !n->sampled) return;
-    dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
     n->writes = n->sampled = 0;
 }
 /* After a copy-engine write, which the 3D engine doesn't order itself against. */
 static void copied(DhdrNative *n)
 {
-    dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
     n->writes = n->sampled = 0;
 }
 static void pass_end(DhdrNative *n)
@@ -912,7 +927,7 @@ static void surface_copy(DhdrNative *n, const DhdrCommand *k)
     if (k->source == k->target) {
         if (!scratch_ready(n, bx + bw, by + bh)) return;
         copy_box(&s->image, s->size, bx, by, &n->scratch, n->scratch_size, bx, by, bw, bh);
-        dkCmdBufBarrier(cmd, DkBarrier_Fragments, 0);
+        barrier(DkBarrier_Fragments, 0);
         copy_box(&n->scratch, n->scratch_size, bx, by, &s->image, s->size, dx, dy, bw, bh);
     } else {
         copy_box(&s->image, s->size, bx, by, &t->image, t->size, dx, dy, bw, bh);
@@ -1026,13 +1041,31 @@ static void surfaces_prepare(DhdrNative *n)
        with contents it was never told of */
     if (n->zcull_stale) {
         surfaces_sync(n);
-        dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        barrier(DkBarrier_None, DkInvalidateFlags_Zcull);
         n->zcull_stale = 0;
     }
 }
 
 /* ---- conversions (convert.rs) ---- */
-static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i)
+/* DHD_NX_CONVERT_BATCH (on unless 0; finding 270 step 3, after finding 112): the conversions render()
+   prepares together at a pass boundary go without a barrier between them. Each reads surfaces and
+   writes its own image; after the first one's barrier nothing but those conversions is recorded, so
+   none reads what another wrote, nor writes what a draw may still be reading. The draws that sample
+   them wait once, after the last (render's reads_surface). Off: a barrier before each, as before. */
+static int convert_batch(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DHD_NX_CONVERT_BATCH");
+        on = !(v && !strcmp(v, "0"));
+        nx_logf("nx renderer: prepared conversions %s (DHD_NX_CONVERT_BATCH)", on ? "batched, one barrier" : "a barrier each");
+    }
+    return on;
+}
+
+/* Conversion i into its image. batched: it follows another of render's prepared run, with nothing
+   recorded between (convert_batch): no barrier. */
+static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i, int batched)
 {
     if (i < 0 || (uint32_t)i >= p->convert_count || i >= CONVERTS) return NULL;
     const DhdrConvert *v = &p->converts[i];
@@ -1061,7 +1094,7 @@ static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i)
         if (!n->has_converted[i]) return NULL;
     }
     pass_end(n);
-    surfaces_sync(n);
+    if (!batched) surfaces_sync(n);
     DkGpuAddr uniform = constants_of(&constants, sizeof constants);
     if (uniform == DK_GPU_ADDR_INVALID) return NULL;
     const Image *base = v->base ? &v->base->image : &dummy;
@@ -1259,6 +1292,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
            otherwise end the pass it is needed in. Their inputs can't change in the run. */
         if (n->target != k->target || n->depth != (depth ? k->depth : -1)) {
             uint64_t prepared = 0;
+            int batched = 0;   /* a conversion of this run recorded: the next needs no barrier */
             for (uint32_t j = i; j < p->command_count; j++) {
                 const DhdrCommand *next = &p->commands[j];
                 if (next->kind != DHDR_CMD_DRAW || next->target != k->target || next->depth != k->depth ||
@@ -1276,8 +1310,8 @@ static void render(DhdrNative *n, const DhdrPicture *p)
                     if (v->surface[s] < SURFACES) stamp[s] = versions[v->surface[s]];
                 }
                 if (in_pass || (conversions[ci] && !memcmp(stamps[ci], stamp, sizeof stamp))) continue;
-                const Image *made = convert_run(n, p, ci);
-                if (made) { conversions[ci] = made; memcpy(stamps[ci], stamp, sizeof stamp); }
+                const Image *made = convert_run(n, p, ci, batched);
+                if (made) { conversions[ci] = made; memcpy(stamps[ci], stamp, sizeof stamp); batched = convert_batch(); }
             }
         }
 
@@ -1313,7 +1347,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
                 if (ci < CONVERTS && conversions[ci] && v && !memcmp(stamps[ci], stamp, sizeof stamp)) {
                     converted = conversions[ci];
                 } else {
-                    converted = convert_run(n, p, ci);
+                    converted = convert_run(n, p, ci, 0);
                     if (ci < CONVERTS && converted) { conversions[ci] = converted; memcpy(stamps[ci], stamp, sizeof stamp); }
                 }
                 last_convert = ci;
@@ -1340,7 +1374,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
             flush_draw(n);
             dkCmdBufBindRenderTarget(cmd, &n->surfaces[k->target].image.view, depth ? &n->surfaces[k->depth].image.view : NULL);
             if (depth || n->zcull_stale) {
-                dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+                barrier(DkBarrier_None, DkInvalidateFlags_Zcull);
                 n->zcull_stale = 0;
             }
             n->target = k->target, n->depth = depth_index;
@@ -1424,6 +1458,60 @@ static void render(DhdrNative *n, const DhdrPicture *p)
     trace_end();
 }
 
+/* DHD_DIRECT_PRESENT (on unless 0, as main's; finding 247): a picture that lies as one rectangle in its
+   display surface, rows doubled or not, is not copied into the display image; the present samples it
+   from the surface (native.wgsl's present_direct, the same sampler on the same texels: the copy was a
+   plain one, nearest, every row twice when doubled). The display image keeps its size and is filled on
+   demand (materialize). Off: the scanout's copy every picture, as before. */
+static int direct_present(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DHD_DIRECT_PRESENT");
+        on = !(v && !strcmp(v, "0"));
+        nx_logf("nx present: %s (DHD_DIRECT_PRESENT)",
+                on ? "from the display surface when it holds the picture as one rectangle" : "from the display image, a copy every picture");
+    }
+    return on;
+}
+
+/* The scanout's copy: rows (sx, sy, w, source_h) of a surface into the display image's top left, w x h
+   (each row twice when h is twice source_h), by the 2D engine. */
+static void scanout_blit(DhdrNative *n, const Image *from, uint32_t sx, uint32_t sy, uint32_t w, uint32_t source_h, uint32_t h)
+{
+    DkImageRect a, b;
+    copy_rect(&a, sx, sy, w, source_h);
+    copy_rect(&b, 0, 0, w, h);
+    surfaces_sync(n);
+    dkCmdBufBlitImage(cmd, &from->view, &a, &n->display.view, &b, DkBlitFlag_FilterNearest, 0);
+    n->writes = n->sampled = 1;
+}
+
+/* The copy a picture shown from its surface skipped, now (scanout.rs's materialize): for what reads the
+   display image itself (the test captures) and before a picture that shows nothing new draws into
+   the surface. From here on the present samples the display image. */
+static void materialize(DhdrNative *n)
+{
+    int i = n->direct_surface;
+    n->direct_surface = -1;
+    if (i < 0 || i >= SURFACES || !n->has_display) return;
+    const Surface *s = &n->surfaces[i];
+    const uint32_t *r = n->direct_rect;
+    if (!s->exists || s->depth || r[0] + r[2] > s->size[0] || r[1] + r[3] > s->size[1]) return;
+    scanout_blit(n, &s->image, r[0], r[1], r[2], r[3], n->direct_h);
+}
+
+/* Whether picture p shows something of its own (a movie, its display surface), so a picture held on its
+   surface only can be left there: the tests of picture()'s scanout. */
+static int will_show(const DhdrNative *n, const DhdrPicture *p)
+{
+    if (p->movie_on && p->movie) return 1;
+    if (p->display_surface < 0 || (uint32_t)p->display_surface >= p->surface_count || p->display_surface >= SURFACES) return 0;
+    const Surface *s = &n->surfaces[p->display_surface];
+    return s->exists && p->display[5] && p->display[6] && p->display[3] * s->scale < s->size[0] &&
+           p->display[4] * s->scale < s->size[1];
+}
+
 static int picture(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count, DhdrPictureResult *out)
 {
     frame_begin();
@@ -1461,6 +1549,10 @@ static int picture(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices,
     }
     uploads_pass();
     surfaces_prepare(n);
+    /* the picture held on its surface (finding 247) is copied out before this one draws there, unless
+       this one replaces it; a grown surface holds its old contents again by here */
+    if (n->direct_surface >= 0 && !will_show(n, p)) materialize(n);
+    n->direct_surface = -1;
     render(n, p);
 
     uint32_t shown = 0;
@@ -1509,12 +1601,15 @@ static int picture(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices,
                                 p->surfaces[p->display_surface].extent[0], p->surfaces[p->display_surface].extent[1],
                                 w, h, d[5], d[6], sx, sy);
                     }
-                    DkImageRect from, to;
-                    copy_rect(&from, sx, sy, w, source_h);
-                    copy_rect(&to, 0, 0, w, h);
-                    surfaces_sync(n);
-                    dkCmdBufBlitImage(cmd, &s->image.view, &from, &n->display.view, &to, DkBlitFlag_FilterNearest, 0);
-                    n->writes = n->sampled = 1;
+                    /* one rectangle, nothing cut off, each row once or exactly twice: the present
+                       samples it where it lies (finding 247); else the copy */
+                    if (direct_present() && shift <= 1 && w == d[5] && h == d[6] && !(shift && h & 1)) {
+                        n->direct_surface = p->display_surface;
+                        n->direct_rect[0] = sx, n->direct_rect[1] = sy, n->direct_rect[2] = w, n->direct_rect[3] = source_h;
+                        n->direct_h = h;
+                    } else {
+                        scanout_blit(n, &s->image, sx, sy, w, source_h, h);
+                    }
                     shown = 1;
                 }
             }
@@ -1703,9 +1798,9 @@ static void capture_image(const Image *t, const char *name, uint64_t picture)
     DkCopyBuf to = {dkMemBlockGetGpuAddr(capture_block), t->w * 4, t->h};
     DkImageRect rect;
     copy_rect(&rect, 0, 0, t->w, t->h);
-    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
+    barrier(DkBarrier_Full, DkInvalidateFlags_Image);
     dkCmdBufCopyImageToBuffer(cmd, &t->view, &rect, &to, 0);
-    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);
+    barrier(DkBarrier_Full, DkInvalidateFlags_L2Cache);
     submit();
     dkQueueWaitIdle(queue);
     char path[128];
@@ -1734,7 +1829,7 @@ static void capture_image(const Image *t, const char *name, uint64_t picture)
 /* A capture writes about ten BMPs to the card, about 4.7 s with the game stopped: none inside DHD_BENCH's
    window, whose speed it would ruin (phase B's menus measured 26.8 fields/s with two of them; finding
    270). One comes right after the window instead. */
-static void capture_pass(DhdrNative *n)
+static int capture_pass(DhdrNative *n)
 {
     static int on = -1, next, after_window;
     static unsigned long long first, last;
@@ -1745,11 +1840,18 @@ static void capture_pass(DhdrNative *n)
         const char *window = getenv("DHD_BENCH");
         if (!window || sscanf(window, "%llu-%llu", &first, &last) != 2 || last <= first) first = last = 0;
     }
-    if (!on) return;
+    if (!on) return 0;
     while (next < AT && last && at[next] >= first && at[next] <= last) next++, after_window = 1;
     if (after_window && nx_pictures > last) after_window = 0;
-    else if (next >= AT || nx_pictures < at[next] || (last && nx_pictures >= first && nx_pictures <= last)) return;
+    else if (next >= AT || nx_pictures < at[next] || (last && nx_pictures >= first && nx_pictures <= last)) return 0;
     else next++;
+    /* a picture on its surface only (finding 247): copied into the display image for its capture, and
+       still presented from the surface, so the screen capture shows present_direct's picture */
+    if (n->direct_surface >= 0) {
+        int held = n->direct_surface;
+        materialize(n);
+        n->direct_surface = held;
+    }
     capture_image(&n->display, "display", nx_pictures);
     nx_logf("nx capture: display %u x %u, heap %u MiB", n->display_w, n->display_h, heap_used >> 20);
     for (int i = 0; i < SURFACES; i++)
@@ -1758,12 +1860,76 @@ static void capture_pass(DhdrNative *n)
             snprintf(name, sizeof name, "s%d", i);
             capture_image(&n->surfaces[i].image, name, nx_pictures);
         }
+    return 1;
+}
+
+/* The present's drawing into target (w x h): black, then the picture in r's rectangle, cut to r's cut,
+   from the display image or, for a picture on its surface only, from that surface (present_direct). */
+static void present_draw(DhdrNative *n, const DkImageView *target, int w, int h, const DhdrPresentRect *r)
+{
+    /* native.wgsl's Present: rect; cover and source (the widescreen fill's, not drawn here); then
+       present_direct's map (the picture's size, its origin in the surface) and mode (rows doubled,
+       0, one over the surface's size) */
+    const Surface *direct = n->direct_surface >= 0 ? &n->surfaces[n->direct_surface] : NULL;
+    float present[20] = {r->rect[0], r->rect[1], r->rect[2], r->rect[3]};
+    if (direct) {
+        present[12] = (float)n->direct_rect[2], present[13] = (float)n->direct_h;
+        present[14] = (float)n->direct_rect[0], present[15] = (float)n->direct_rect[1];
+        present[16] = n->direct_h != n->direct_rect[3] ? 1.0f : 0.0f;
+        present[18] = 1.0f / (float)direct->image.w, present[19] = 1.0f / (float)direct->image.h;
+    }
+    uint32_t present_bytes = direct ? (uint32_t)sizeof present : 16;
+    DkGpuAddr uniform = constants_of(present, present_bytes);
+    dkCmdBufBindRenderTarget(cmd, target, NULL);
+    DkViewport viewport = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+    dkCmdBufSetViewports(cmd, 0, &viewport, 1);
+    /* the whole screen before the clear: clears respect the scissor */
+    DkScissor whole = {0, 0, (uint32_t)w, (uint32_t)h};
+    dkCmdBufSetScissors(cmd, 0, &whole, 1);
+    DkColorState color;
+    dkColorStateDefaults(&color);
+    dkCmdBufBindColorState(cmd, &color);
+    DkColorWriteState writes;
+    dkColorWriteStateDefaults(&writes);
+    dkCmdBufBindColorWriteState(cmd, &writes);
+    DkDepthStencilState depth;
+    dkDepthStencilStateDefaults(&depth);
+    depth.depthTestEnable = 0, depth.depthWriteEnable = 0;
+    dkCmdBufBindDepthStencilState(cmd, &depth);
+    n->rect_pixel = NULL;
+    dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+    int left = r->cut[0] < 0 ? 0 : r->cut[0], top = r->cut[1] < 0 ? 0 : r->cut[1];
+    int right = r->cut[2] > w ? w : r->cut[2], bottom = r->cut[3] > h ? h : r->cut[3];
+    if (right > left && bottom > top && uniform != DK_GPU_ADDR_INVALID) {
+        DkScissor cut = {(uint32_t)left, (uint32_t)top, (uint32_t)(right - left), (uint32_t)(bottom - top)};
+        dkCmdBufSetScissors(cmd, 0, &cut, 1);
+        DkShader const *shaders[2] = {&shader_fullscreen, direct ? &shader_present_direct : &shader_present};
+        dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
+        raster_bind(0);
+        dkCmdBufBindUniformBuffer(cmd, DkStage_Fragment, 0, uniform, present_bytes);
+        const Image *source = direct ? &direct->image : &n->display;
+        dkCmdBufBindTexture(cmd, DkStage_Fragment, 0, dkMakeTextureHandle((uint32_t)source->sampled, n->present_sampler));
+        descriptors_sync();
+        dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+        n->sampled = 1;
+    }
 }
 
 int dhdr_native_present(DhdrNative *n, DhdrSurface *s, const DhdrPresentRect *r)
 {
     if (!n->has_display || !r->window_w || !r->window_h) return 0;
-    capture_pass(n);
+    if (capture_pass(n)) {
+        /* what the present draws, into an image of the screen's size, as BMP: the picture on the
+           screen (present_direct's or present_pixel's) without the screen image's compression */
+        static Image shot;
+        static int has_shot;
+        if (!has_shot) has_shot = image_make_with(&shot, (uint32_t)s->w, (uint32_t)s->h, DkImageFormat_RGBA8_Unorm, SURFACE_FLAGS, 1, 0);
+        if (has_shot) {
+            surfaces_sync(n);
+            present_draw(n, &shot.view, s->w, s->h, r);
+            capture_image(&shot, "screen", nx_pictures);
+        }
+    }
     {
         static int told;
         if (told < 3 && told++ >= 0)
@@ -1779,41 +1945,9 @@ int dhdr_native_present(DhdrNative *n, DhdrSurface *s, const DhdrPresentRect *r)
     nx_render_stage = "presenting";
     nx_presents++;
     surfaces_sync(n);
-    DkGpuAddr uniform = constants_of(r->rect, 16);
-    dkCmdBufBindRenderTarget(cmd, &s->images[s->acquired].view, NULL);
-    DkViewport viewport = {0.0f, 0.0f, (float)s->w, (float)s->h, 0.0f, 1.0f};
-    dkCmdBufSetViewports(cmd, 0, &viewport, 1);
-    /* the whole screen before the clear: clears respect the scissor */
-    DkScissor whole = {0, 0, (uint32_t)s->w, (uint32_t)s->h};
-    dkCmdBufSetScissors(cmd, 0, &whole, 1);
-    DkColorState color;
-    dkColorStateDefaults(&color);
-    dkCmdBufBindColorState(cmd, &color);
-    DkColorWriteState writes;
-    dkColorWriteStateDefaults(&writes);
-    dkCmdBufBindColorWriteState(cmd, &writes);
-    DkDepthStencilState depth;
-    dkDepthStencilStateDefaults(&depth);
-    depth.depthTestEnable = 0, depth.depthWriteEnable = 0;
-    dkCmdBufBindDepthStencilState(cmd, &depth);
-    n->rect_pixel = NULL;
-    dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
-    int left = r->cut[0] < 0 ? 0 : r->cut[0], top = r->cut[1] < 0 ? 0 : r->cut[1];
-    int right = r->cut[2] > s->w ? s->w : r->cut[2], bottom = r->cut[3] > s->h ? s->h : r->cut[3];
-    if (right > left && bottom > top && uniform != DK_GPU_ADDR_INVALID) {
-        DkScissor cut = {(uint32_t)left, (uint32_t)top, (uint32_t)(right - left), (uint32_t)(bottom - top)};
-        dkCmdBufSetScissors(cmd, 0, &cut, 1);
-        DkShader const *shaders[2] = {&shader_fullscreen, &shader_present};
-        dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
-        raster_bind(0);
-        dkCmdBufBindUniformBuffer(cmd, DkStage_Fragment, 0, uniform, 16);
-        dkCmdBufBindTexture(cmd, DkStage_Fragment, 0, dkMakeTextureHandle((uint32_t)n->display.sampled, n->present_sampler));
-        descriptors_sync();
-        dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
-        n->sampled = 1;
-    }
+    present_draw(n, &s->images[s->acquired].view, s->w, s->h, r);
     fps_overlay(cmd, s->h);
-    dkCmdBufBarrier(cmd, DkBarrier_Fragments, 0);
+    barrier(DkBarrier_Fragments, 0);
     nx_t_present_ns += now_ns() - record;
     submit();
     return 1;
@@ -1848,7 +1982,7 @@ int dhdr_native_zread_start(DhdrNative *n, uint32_t index, const uint32_t rect[4
     dkCmdBufBindTexture(cmd, DkStage_Compute, 0, dkMakeTextureHandle((uint32_t)s->image.sampled, SAMPLER_NEAREST));
     descriptors_sync();
     dkCmdBufDispatchCompute(cmd, (w + 7) / 8, (h + 7) / 8, 1);
-    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);   /* compute: the one that waits for it */
+    barrier(DkBarrier_Full, DkInvalidateFlags_L2Cache);   /* compute: the one that waits for it */
     nx_t_record_ns += now_ns() - record;
     submit();
     dkQueueSignalFence(queue, &n->zread[slot].fence, true);

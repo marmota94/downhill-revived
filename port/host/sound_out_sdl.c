@@ -29,7 +29,9 @@
    it (or unplugs the one in use). No device is opened in headless runs (DHD_HEADLESS) or with
    DHD_SND_OFF. Counters (DHD_BENCH window: one "bench snd:" line; DHD_SND_HOST_TRACE=1: a line
    per second): underruns (gaps), silence written inside gaps, frames dropped or skipped, queue
-   level, and the game's tick interval. */
+   level, and the game's tick interval. The bench line and "snd session:", written at exit for
+   the whole run, also give the mixer's time on the game thread: the wall time from each sound
+   tick's start to the last PCM it hands over here (port/hle/sound.c, sound_tick), per tick. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +58,9 @@ static volatile int host_hist_reset;
 static volatile double host_ratio = 1.0;
 static volatile double host_tempo = 1.0;   /* stretch tempo (1: copied) */
 static volatile long host_stretched;       /* output frames made by the time stretcher */
+static volatile double host_mix_seconds;   /* the mixer's wall time on the game thread (sound_tick) */
+static volatile long host_mix_ticks;       /* sound ticks with the output open */
+static double mix_mark;                    /* this tick's start or last handover; 0: not timed */
 
 static int trace_on(void)
 {
@@ -112,23 +117,39 @@ static unsigned host_percentile(volatile long *hist, unsigned bins, double fract
 /* DHD_BENCH window start (0) and end (1), called by present.c. */
 void snd_host_bench(int end)
 {
-    static long underruns, silence, dropped, skipped, frames, stretched;
+    static long underruns, silence, dropped, skipped, frames, stretched, mix_ticks;
+    static double mix_seconds;
     const double per_ms = SND_RATE / 1000.0;
     if (!end) {
         underruns = host_underruns; silence = host_silence; dropped = host_dropped;
         skipped = host_skipped; frames = host_frames; stretched = host_stretched;
+        mix_seconds = host_mix_seconds; mix_ticks = host_mix_ticks;
         host_hist_reset = 1;
         memset((void *)host_tick_hist, 0, sizeof host_tick_hist);
         return;
     }
     fprintf(stderr, "bench snd: underruns=%ld silence_ms=%.1f dropped_ms=%.1f skipped_ms=%.1f played_s=%.2f "
-            "queue_ms p1=%u p50=%u p99=%u rate_ppm=%+.0f tick_ms p50=%.1f p99=%.1f max=%.1f stretched_s=%.2f\n",
+            "queue_ms p1=%u p50=%u p99=%u rate_ppm=%+.0f tick_ms p50=%.1f p99=%.1f max=%.1f stretched_s=%.2f "
+            "mix_ms_per_tick=%.3f\n",
             host_underruns - underruns, (host_silence - silence) / per_ms, (host_dropped - dropped) / per_ms,
             (host_skipped - skipped) / per_ms, (host_frames - frames) / (double)SND_RATE,
             host_percentile(host_queue_hist, 512, 0.01), host_percentile(host_queue_hist, 512, 0.5),
             host_percentile(host_queue_hist, 512, 0.99), (host_ratio - 1) * 1e6,
             host_percentile(host_tick_hist, 128, 0.5) * 0.5, host_percentile(host_tick_hist, 128, 0.99) * 0.5,
-            host_percentile(host_tick_hist, 128, 1.0) * 0.5, (host_stretched - stretched) / (double)SND_RATE);
+            host_percentile(host_tick_hist, 128, 1.0) * 0.5, (host_stretched - stretched) / (double)SND_RATE,
+            host_mix_ticks > mix_ticks ? (host_mix_seconds - mix_seconds) * 1000 / (host_mix_ticks - mix_ticks) : 0.0);
+}
+
+/* At exit (host_end, the report stage): the whole run's counters, one line. */
+static void snd_session(void)
+{
+    const double per_ms = SND_RATE / 1000.0;
+    fprintf(stderr, "snd session: underruns=%ld silence_ms=%.1f dropped_ms=%.1f skipped_ms=%.1f played_s=%.2f "
+            "stretched_s=%.2f mix_ms_per_tick=%.3f ticks=%ld\n",
+            host_underruns, host_silence / per_ms, host_dropped / per_ms, host_skipped / per_ms,
+            host_frames / (double)SND_RATE, host_stretched / (double)SND_RATE,
+            host_mix_ticks ? host_mix_seconds * 1000 / host_mix_ticks : 0.0, host_mix_ticks);
+    fflush(stderr);
 }
 
 /* ---------------- the time-stretch stage: ring -> fifo, copied or WSOLA-stretched ---------------- */
@@ -301,7 +322,7 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
     }
     need = device > padding ? device - padding : 0;
     if (!need) return;
-    if (need > ST_FIFO - ST_HOP) need = ST_FIFO - ST_HOP;
+    if (need > ST_FIFO - 2 * ST_HOP) need = ST_FIFO - 2 * ST_HOP;  /* room for the rate's extra input */
     host_histograms(queued);
     if (out.trace) {
         double now = host_wall_seconds();
@@ -328,7 +349,11 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
         /* proportional rate control: +0.5% when 50% over the cushion (copying only) */
         double error = tempo < 1.0 ? 0 : fill * 0.01;
         host_ratio = 1.0 + (error > RATE_RANGE ? RATE_RANGE : error < -RATE_RANGE ? -RATE_RANGE : error);
-        st_fill(need + 2, tempo);
+        /* `need` output frames at `ratio` read about need * ratio fifo frames, plus the one ahead
+           that the interpolation reads. A fill of need + 2 ran short by a frame or two whenever the
+           rate went above about +1000 ppm: a gap (an underrun, and a click) wherever the device
+           holds no more than one pull beyond this one, as audout does on the Switch (finding 270). */
+        st_fill((unsigned)ceil(need * host_ratio) + 2, tempo);
         made = host_resample(buf, need, host_ratio, &out.phase);
         if (made < need && padding - request + made < request) {
             out.running = 0; /* out of cushion: this pull runs short; one gap, then build it again */
@@ -406,6 +431,7 @@ static void host_start(void)
     /* The stream lives as long as the process; host_stop closes it at the end (host_end; a
        host_exit, _exit, ends the process without it). */
     host_stream = stream;
+    host_end_add(HOST_END_REPORT, "sound summary", snd_session);
     host_end_add(HOST_END_DEVICES, "audio", host_stop);
 }
 
@@ -423,6 +449,11 @@ void host_sound_open(void)
 void host_sound_write(const int16_t *stereo, int frames)
 {
     ring_push(stereo, frames);
+    if (mix_mark > 0) {  /* the chunk just rendered, since the tick's start or the last chunk */
+        double now = host_wall_seconds();
+        host_mix_seconds += now - mix_mark;
+        mix_mark = now;
+    }
 }
 
 void host_sound_away(int away)
@@ -442,11 +473,14 @@ void host_sound_reset(void)
     ring_read = ring_write = 0;
 }
 
-/* Wall-clock diagnostics: how evenly the game thread renders (DHD_BENCH only). */
+/* Wall-clock diagnostics: how evenly the game thread renders (DHD_BENCH), and the mixer's time. */
 void host_sound_tick(void)
 {
     static double previous;
     double now = host_wall_seconds();
+    /* the mixer's time starts here, once the output is open (the first tick opens it) */
+    mix_mark = host_stream ? now : 0;
+    if (host_stream) host_mix_ticks++;
     if (previous > 0) {
         unsigned bin = (unsigned)((now - previous) * 2000);
         host_tick_hist[bin < 127 ? bin : 127]++;
