@@ -347,12 +347,33 @@ static void heartbeat_line(double now)
     last = now, last_field = field;
 }
 
-/* A --pgo-generate build: the counters to the card before anything can go wrong on the way out. */
+/* A --pgo-generate build: the counters to the card before anything can go wrong on the way out.
+   libgcov writes each object's counters to sdmc:/dhd-pgo/ followed by the object's full path in the
+   build (NX_PGO_DIR is the object folder, from build_host64.py), and devkitA64's libgcov has no mkdir:
+   a folder missing there drops the file ("profiling:...:Skip"). So the folders are made here first. */
 extern void __gcov_dump(void) __attribute__((weak));
+static void nx_profile_folders(void)
+{
+#ifdef NX_PGO_DIR
+    char path[512];
+    int n = snprintf(path, sizeof path, "sdmc:/dhd-pgo%s%s", NX_PGO_DIR[0] == '/' ? "" : "/", NX_PGO_DIR);
+    if (n <= 0 || (size_t)n >= sizeof path) return;
+    for (char *s = path + strlen("sdmc:/"); ; s++)
+        if (*s == '/' || !*s) {
+            char c = *s;
+            *s = 0;
+            if (s[-1] != '/') mkdir(path, 0777);  /* one level at a time; an existing one is fine */
+            *s = c;
+            if (!c) break;
+        }
+    fprintf(stderr, "nx: the profile goes under %s\n", path);
+#endif
+}
 static void nx_profile_dump(void)
 {
     static int written;
     if (!__gcov_dump || written++) return;
+    nx_profile_folders();
     fprintf(stderr, "nx: writing the profile\n");
     fflush(stderr);
     __gcov_dump();

@@ -568,6 +568,8 @@ def main():
                 extra += ['-I'+str(ROOT/'port/render/include')]  # dhd_render.h
             if rel.endswith('host64/launcher.c') and t.switch:
                 extra += ['-Dmain=dhd_launcher_main']  # main is nx_host.c's
+            if rel.endswith('nx/src/nx_host.c') and a.pgo_generate:
+                extra += ['-DNX_PGO_DIR="%s"' % objdir.as_posix()]  # the .gcda files' folder on the card
             if rel.endswith('host64/launcher.c') and t.android:
                 extra += ['-Dmain=dhd_launcher_main']  # SDL_main (android_main.c) calls it
             if rel.endswith('host64/launcher.c') and t.ios:

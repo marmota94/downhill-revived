@@ -151,7 +151,11 @@ code (`core_*.c`) and `vu0_interp.c` carry the profile, for three reasons found 
 - libgcov's indirect call profiler reads TLS through `tpidr_el0`, which is 0 here, and faulted at
   0x4e8. `port/nx/pgo/gcov_tls.c` replaces it with a `-mtp=soft` build; link it into the training build.
 - libgcov could not create its folders under `sdmc:`, so nothing was saved ("profiling:...:Skip").
-  Create `sdmc:/dhd-pgo/<the object folder's full path>` on the card before the training run.
+  devkitA64's libgcov has no `mkdir` at all (its `_gcov.o` imports none), and each `.gcda` goes to
+  `sdmc:/dhd-pgo/` followed by the object's full path in the build, unmangled. A training build now
+  makes that folder itself before it writes the profile (`nx_host.c`'s `nx_profile_folders`, given
+  the object folder by `build_host64.py`). The using build must have the same object folder (the
+  same `--out`), or gcc finds no profile.
 
 Race benchmark, fields 6000-7000, official charger, 1785/921/1600 MHz:
 
