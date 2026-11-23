@@ -318,11 +318,16 @@ def main():
     pgo.add_argument('--pgo-use', type=Path, metavar='PROFDATA',
                      help="optimize with this profile (llvm-profdata merge of the .profraw files; switch-arm64: a folder of .gcda files)")
     # switch-arm64 experiments (finding 270 step 2): each a build switch until a console run decides
+    p.add_argument('--lto', choices=('host', 'all'),
+                   help="switch-arm64: gcc link-time optimization over the host's C and the glue (host), or over "
+                        "the module's C too (all)")
     p.add_argument('--pgo-scope', choices=('game', 'all'), default='game',
                    help="switch-arm64 --pgo-generate/--pgo-use: the profile over the module's C and vu0_interp.c "
                         "(game, the default) or over every unit (all)")
     a = p.parse_args()
     t = TARGETS[a.target]
+    if a.lto and not t.switch:
+        p.error('--lto is for switch-arm64')
     if not a.fiber_test and not a.fake and not a.module:
         # no module named: build_wasm.py's output (port/tools/build.py builds both in order)
         default = ROOT / 'build' / 'wasm' / 'dhd_core.wasm'
@@ -562,6 +567,8 @@ def main():
         objdir = work/'obj'
         suffix = '.obj' if t.windows else '.o'
 
+        module_c = set(map(str, units))  # the module's C (wasm2c's parts or the chunks)
+
         def compile_one(source, timeout=1800):
             source = Path(source)
             rel = source.relative_to(ROOT).as_posix() if source.is_relative_to(ROOT) else source.name
@@ -587,6 +594,10 @@ def main():
             # profiler (TLS from tpidr_el0, which is 0 here), now port/nx/pgo/gcov_tls.c (finding 270)
             if t.switch and pgo_flags and a.pgo_scope == 'game' and not (source.name.startswith('core_') or rel.endswith('vu0_interp.c')):
                 flags = [x for x in common if x not in pgo_flags]
+            # LTO: not fiber_arm64.c, whose top-level asm calls fiber_entry, a reference the LTO plugin
+            # cannot see in an LTO object (fiber_entry could be dropped); from a plain object it is kept
+            if a.lto and not rel.endswith('fiber_arm64.c') and (a.lto == 'all' or str(source) not in module_c):
+                extra += ['-flto']
             cmd = flags + extra + (['/c', source, '/Fo'+str(obj)] if t.windows else [source, '-o', obj])
             # the shared object cache (objcache.py); this output folder is a token
             objcache.compile(list(map(str, cmd)), str(obj), lambda c: run(c, timeout=14400 if t.switch and pgo_flags else timeout) and None,
@@ -624,6 +635,8 @@ def main():
         else:
             library = work/('host64.lib' if t.windows else 'libhost64.a')
             library.unlink(missing_ok=True)  # ar adds to an archive that is there: a stale member could win
+            if a.lto:  # gcc-ar: the archive's symbol index of LTO objects comes from gcc's plugin
+                ar = tools / 'aarch64-none-elf-gcc-ar'
             run([a.llvm/'llvm-lib.exe', '/out:'+str(library), *host_objects] if t.windows else
                 [ar, 'rcs', library, *host_objects])
         # rustc's list for the library (checked by rustgs against the target's allow-list)
@@ -659,10 +672,15 @@ def main():
             if a.pgo_generate:  # before libgcov, which reads TLS from tpidr_el0 (0 here): port/nx/pgo/gcov_tls.c
                 gcov_tls = [objdir/'gcov_tls.o']
                 run([cc, *t.flags[:5], '-O2', '-c', ROOT/'port/nx/pgo/gcov_tls.c', '-o', gcov_tls[0]])
-            run([cc, '-specs='+str(kit/'libnx/switch.specs'), *t.flags[:4], '-fPIE', '-g', '-Wl,--gc-sections',
+            # LTO's code generation runs here, in -flto=jobs parts: the compile's optimization and float
+            # flags again (each function also carries its own from the compile)
+            lto = ['-flto=%d' % jobs, '-O3', '-frounding-math', '-ffp-contract=off', '-fno-fast-math',
+                   '-ftrivial-auto-var-init=zero', '-fno-strict-aliasing', '-ffunction-sections', '-fdata-sections',
+                   '-fwrapv', '-w'] if a.lto else []
+            run([cc, '-specs='+str(kit/'libnx/switch.specs'), *t.flags[:4], '-fPIE', '-g', '-Wl,--gc-sections', *lto,
                  *gcov_tls, *(['-fprofile-generate', '-Wl,-u,__gcov_dump'] if a.pgo_generate else []),
                  '-L'+str(kit/'libnx/lib'), *objects, library, '-ldeko3d', '-lnx', '-lm', '-o', exe,
-                 '-Wl,-Map,'+str(out/'dhd.map')], timeout=3600)
+                 '-Wl,-Map,'+str(out/'dhd.map')], timeout=14400 if a.lto else 3600)
             nacp, nro = out/'dhd.nacp', out/'downhill-revived.nro'
             run([kit/'tools/bin/nacptool', '--create', 'Downhill Revived', 'skuza-oss', '0.7.6', nacp])
             run([kit/'tools/bin/elf2nro', exe, nro, '--nacp='+str(nacp), '--icon='+str(ROOT/'port/nx/icon.jpg')])
