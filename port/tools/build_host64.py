@@ -590,10 +590,16 @@ def main():
             obj = objdir/(rel.replace('/', '_') + suffix)
             flags = common
             # the Switch's profile covers the game's code and VU only (game), or every unit (all, untested
-            # on a console). The hang an instrumented host gave at start fits libgcov's indirect call
-            # profiler (TLS from tpidr_el0, which is 0 here), now port/nx/pgo/gcov_tls.c (finding 270)
-            if t.switch and pgo_flags and a.pgo_scope == 'game' and not (source.name.startswith('core_') or rel.endswith('vu0_interp.c')):
+            # on a console). The hang an instrumented host gave at start was libgcov's indirect call
+            # profiler: every instrumented function's prologue reads TLS, through tpidr_el0 (0 here) in
+            # libgcov's own copy, the exception handler's too; now port/nx/pgo/gcov_tls.c (finding 270)
+            game_unit = source.name.startswith('core_') or rel.endswith('vu0_interp.c')
+            if t.switch and pgo_flags and a.pgo_scope == 'game' and not game_unit:
                 flags = [x for x in common if x not in pgo_flags]
+            # the host's units run on several threads at once (vu, gs, native, sound): their counters and
+            # value lists are updated atomically; the game's units run on the game thread only
+            if t.switch and a.pgo_generate and a.pgo_scope == 'all' and not game_unit:
+                flags = [('-fprofile-update=atomic' if x == '-fprofile-update=single' else x) for x in common]
             # LTO: not fiber_arm64.c, whose top-level asm calls fiber_entry, a reference the LTO plugin
             # cannot see in an LTO object (fiber_entry could be dropped); from a plain object it is kept
             if a.lto and not rel.endswith('fiber_arm64.c') and (a.lto == 'all' or str(source) not in module_c):
