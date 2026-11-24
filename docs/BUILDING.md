@@ -552,8 +552,8 @@ Make one when the Switch's hot code has changed a lot (the core, `vu0_interp.c`,
 2. On the console: `nx_fulltest.py --only AC --no-capture --race-timeout 2400 --nro
    build/switch-pgo-all/downhill-revived.nro`. At the bench window's end the game writes one
    `.gcda` per object under `sdmc:/dhd-pgo/src/build/switch-pgo-all/obj/` and logs
-   `nx: profile written`. The training build's exit then hangs (open, finding 270): press Home,
-   close the game and start sphaira again; the test restores `dhd.ini`.
+   `nx: profile written`. If the game then stays on screen, press Home, close it and start
+   sphaira again; the test restores `dhd.ini`.
 3. Fetch `/dhd-pgo/` by FTP into a folder `P`, keeping its layout, and zip `P`'s contents as
    `dhd-switch-pgo.zip`.
 
@@ -571,7 +571,6 @@ one worth a new `-switch.N` release when it lands:
   - Threads and cores: the game thread limits the race. Keep a change only for about 3 % or more,
     measured as alternating pairs of runs (one run swings by up to 30 %).
   - A narrower fix for uam's schedule than waiting on every barrier, if it is faster.
-  - The training build's hang at exit.
 - **Docked default scale 2**, only once a run holds 60.
 - **The error after closing the Homebrew Menu.** Find out whether sphaira alone, closed with +,
   also shows "The software was closed because an error occurred" (reported by others; if so, it is
