@@ -148,10 +148,28 @@ The limit is now the game thread, then `vu`: both are over the 16.7 ms a field h
 code (`core_*.c`) and `vu0_interp.c` carry the profile, for three reasons found on the console:
 
 - With every file instrumented, the game stopped after its first log line and showed a black screen.
+  Read statically since (2026-11-23, not yet run on the console): gcc calls libgcov's indirect call
+  profiler in the prologue of every instrumented function that can be called through a pointer
+  (79165 calls in a `--pgo-scope all` build, `__libnx_exception_handler` among them), and libgcov's
+  copy reads `tpidr_el0` (the next point). So with every unit instrumented and no `gcov_tls.c`,
+  nearly the first host function after the first log line faulted, and so did the exception
+  handler's own prologue: most likely why there was no report, only a black screen. With the game's
+  scope only the module's C faulted, outside any crash path, and 0x4e8 could be read. The three points come from one
+  commit, so the full scope was not tried again with `gcov_tls.c`. A `--pgo-scope all` build with it
+  has no `tpidr_el0` read left (objdump: 0, against 234 `tpidrro_el0`) and no LSE instruction.
+  Everything else libgcov needs works on libnx (`calloc` in the value profilers, `fopen`/`fwrite`
+  and a pthread mutex at the dump only). The host's units run on several threads at once, so in
+  that scope they count with `-fprofile-update=atomic` (and `gcov_tls.c` has the atomic profiler
+  too); the game's units stay `single`. `--pgo-scope all` instruments every unit for the console
+  run that settles it; `game` (the default) is the scope above.
 - libgcov's indirect call profiler reads TLS through `tpidr_el0`, which is 0 here, and faulted at
   0x4e8. `port/nx/pgo/gcov_tls.c` replaces it with a `-mtp=soft` build; link it into the training build.
 - libgcov could not create its folders under `sdmc:`, so nothing was saved ("profiling:...:Skip").
-  Create `sdmc:/dhd-pgo/<the object folder's full path>` on the card before the training run.
+  devkitA64's libgcov has no `mkdir` at all (its `_gcov.o` imports none), and each `.gcda` goes to
+  `sdmc:/dhd-pgo/` followed by the object's full path in the build, unmangled. A training build now
+  makes that folder itself before it writes the profile (`nx_host.c`'s `nx_profile_folders`, given
+  the object folder by `build_host64.py`). The using build must have the same object folder (the
+  same `--out`), or gcc finds no profile.
 
 Race benchmark, fields 6000-7000, official charger, 1785/921/1600 MHz:
 
