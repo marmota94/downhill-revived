@@ -521,16 +521,41 @@ upstream's `v<version>` tags that the fork also carries.
 
 Steps, in order:
 
-1. Build the NRO from the commit to tag (the Docker build or the Mac steps above).
+1. Build the NRO from the commit to tag (the Docker build or the Mac steps above) with the
+   profile: take `dhd-switch-pgo.zip` from the latest Switch release, unzip it into a folder `P`
+   (it holds `src/build/switch-pgo-all/obj/*.gcda`), then
+
+       python3 port/tools/build_host64.py --target switch-arm64 --pgo-use P --pgo-scope all \
+           --out build/switch-pgo-all build/wasm/dhd_core.wasm
+
+   The NRO is `build/switch-pgo-all/downhill-revived.nro`. `--out` must be `build/switch-pgo-all`:
+   gcc finds each object's counts under the path the training build had. A profile older than the
+   code still builds (`-Wno-missing-profile`); changed functions lose their gain until it is made
+   again (below).
 2. Run `nx_fulltest.py --only ABC` with that NRO on a console: phases A-C pass, the race ends and
    EXIT GAME returns to the Homebrew Menu.
-3. Next to the NRO, `sha256sum downhill-revived.nro > SHA256SUMS`.
+3. Next to the NRO, `sha256sum downhill-revived.nro dhd-switch-pgo.zip > SHA256SUMS`.
 4. Push the commit, then `gh release create v<version>-switch.N -R <fork> --target <full commit
-   id> --latest --notes-file <notes> downhill-revived.nro SHA256SUMS` (`--prerelease` instead of
-   `--latest` for a test build). Name the fork with `-R`:
-   `gh`'s default repository may be upstream. `--target` refuses a short commit id.
+   id> --latest --notes-file <notes> downhill-revived.nro dhd-switch-pgo.zip SHA256SUMS`
+   (`--prerelease` instead of `--latest` for a test build). Name the fork with `-R`:
+   `gh`'s default repository may be upstream. `--target` refuses a short commit id. The profile
+   goes with every release, so the next one can build from it; it is never committed.
 5. The notes say how to install (README, "How to play on the Switch"), what works, the measured speed
    with its clocks, and what is missing (the open work below).
+
+#### A new Switch profile
+
+Make one when the Switch's hot code has changed a lot (the core, `vu0_interp.c`, the renderer):
+
+1. The training build: `build_host64.py --target switch-arm64 --pgo-generate --pgo-scope all --out
+   build/switch-pgo-all build/wasm/dhd_core.wasm` (about 60 MB, several times slower).
+2. On the console: `nx_fulltest.py --only AC --no-capture --race-timeout 2400 --nro
+   build/switch-pgo-all/downhill-revived.nro`. At the bench window's end the game writes one
+   `.gcda` per object under `sdmc:/dhd-pgo/src/build/switch-pgo-all/obj/` and logs
+   `nx: profile written`. The training build's exit then hangs (open, finding 270): press Home,
+   close the game and start sphaira again; the test restores `dhd.ini`.
+3. Fetch `/dhd-pgo/` by FTP into a folder `P`, keeping its layout, and zip `P`'s contents as
+   `dhd-switch-pgo.zip`.
 
 #### Open work for the Switch releases
 
@@ -541,10 +566,12 @@ one worth a new `-switch.N` release when it lands:
 - **A steady 60.** The target is stock clocks, 1020/460/1331 MHz with sys-clk off: there a race
   runs at about 40 fields a second (finding 270, 2026-11-23: main's draw stages with a hazard-free
   schedule, batched conversions, the present from the display surface). The work, in order:
-  - `native_vu` on by default on the Switch, measured at those clocks.
-  - Profile-guided build, threads and cores, LTO and `-mcpu=cortex-a57`. Keep a change only for
-    about 3 % or more over the race.
+  The profile-guided build adds about 21 % (finding 270, 2026-11-24); `native_vu` on (-11 %), LTO
+  (-30 %) and `-mcpu=cortex-a57` (no change) were measured and stay out. Still open:
+  - Threads and cores: the game thread limits the race. Keep a change only for about 3 % or more,
+    measured as alternating pairs of runs (one run swings by up to 30 %).
   - A narrower fix for uam's schedule than waiting on every barrier, if it is faster.
+  - The training build's hang at exit.
 - **Docked default scale 2**, only once a run holds 60.
 - **The error after closing the Homebrew Menu.** Find out whether sphaira alone, closed with +,
   also shows "The software was closed because an error occurred" (reported by others; if so, it is

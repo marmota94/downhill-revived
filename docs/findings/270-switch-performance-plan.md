@@ -335,9 +335,30 @@ merge in a throwaway worktree. Nothing from it is used here.
     underruns and 0 ms of silence in the combined race (1178 before). The bench line gains
     `mix_ms_per_tick` (about 1.5-2.2 ms) and the exit a `snd session:` line. Moving the mixer off
     the game thread is not done: its results feed game state inside the core.
-  - `switch/cpu-flags` (`-mcpu=cortex-a57`, LTO, the PGO hang) was stopped before a build finished.
   - A first combined run left the race at field 3337 through EXIT GAME's path with no bench line;
     the rerun, with nobody touching the console, passed. Not explained beyond that.
+- [x] 2026-11-23/24 (same clocks), `native_vu = on` with the combined build: 36.1 fields/s against
+  40.4 off. The VU thread drops from about 34 to 20 ms a field, but the present waits up to 19 ms:
+  at 460 MHz the GPU's mesh draws cost more than they save. It stays off.
+- [x] 2026-11-24, `switch/cpu-flags` (merged into `main`, `ccbe1a05`):
+  - `-mcpu=cortex-a57`: the build already passes `-march=armv8-a+crc+crypto -mtune=cortex-a57`;
+    gcc's target state and two units' code are identical with it. No change.
+  - LTO (`--lto all`, `--lto host`): 26.8 and 27.9 fields/s against 39.2 without, the VU and GS
+    threads about twice as slow; the shaders were checked identical. Not used; why LTO loses this
+    much is not known.
+  - The PGO hang at start: gcc puts `__gcov_indirect_call_profiler_v4` in every instrumented
+    function that can be called through a pointer, and libgcov's copy reads `tpidr_el0`, 0 on
+    Horizon, so the first host function (and the crash handler's prologue) faulted.
+    `port/nx/pgo/gcov_tls.c` gives the profiler its own storage; with `--pgo-scope all` the host
+    units count atomically (`-fprofile-update=atomic`), the game units stay `single`. The training
+    build now runs: 9 fields/s, 192 `.gcda` files at the bench's end. Its exit hangs after
+    `nx: profile written` (open).
+  - PGO over every unit (`--pgo-use P --pgo-scope all`), against the same NRO without it, in
+    alternating runs: window 28.6 against 35.2 fields/s, whole-race median 29.6 against 35.9
+    (+21 %; three pairs, PGO ahead in each). The picture is right. A single run swings by up to
+    30 % (the delta-time clock puts each run in a different stretch of the route, and the console
+    warms over a session), so earlier single-run comparisons carry that noise.
+  - The VU kernels use NEON (15-76 % of their instructions on vector registers).
 
 ## Decisions
 
@@ -353,6 +374,11 @@ merge in a throwaway worktree. Nothing from it is used here.
   that keeps more of uam's schedule could be faster.
 - The performance target is stock clocks, 1020/460/1331 MHz with sys-clk off (the owner,
   2026-11-23). Numbers at 1785/768/1600 from before that date compare only with each other.
+- Switch releases are built with the profile (`--pgo-use`, every unit). The profile is never
+  committed: it goes with each Switch release as `dhd-switch-pgo.zip` (about 1 MB, the
+  `.gcda` files) and the next release builds from it (`docs/BUILDING.md`, "Switch releases"; the
+  owner, 2026-11-24). It is made again when the hot code has changed a lot.
+- A speed change counts only from alternating pairs of runs, not from one run each.
 
 ## Surprises
 

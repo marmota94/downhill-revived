@@ -59,8 +59,9 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
   the open work: `docs/BUILDING.md`, "Switch releases"):**
   `build_host64.py --target switch-arm64` makes an NRO
   for a modded console (devkitA64 and libnx, a deko3d renderer in C, `port/nx`; findings 272, 270).
-  Title, menus and a race run on the console, the race at about 40 fields/s at the target's stock
-  clocks (1020/460/1331 MHz); EXIT GAME returns to the Homebrew Menu. Its shaders are main's, the
+  Title, menus and a race run on the console, the race at about 30-40 fields/s at the target's stock
+  clocks (1020/460/1331 MHz), about 21 % more with the release's profile-guided build
+  (`dhd-switch-pgo.zip`, never committed); EXIT GAME returns to the Homebrew Menu. Its shaders are main's, the
   draw stages with a hazard-free schedule in place of uam's (finding 270); button rebinding
   is `controls.rs`'s rules in C (`settings_nx.c`, tried by hand on a console); `fps = 30` gives a
   steady 30. Native VU's mesh path draws right but is off by default; no online or texture packs.
